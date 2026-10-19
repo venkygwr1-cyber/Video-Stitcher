@@ -5,6 +5,11 @@ import tempfile
 
 import streamlit as st
 
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
 st.set_page_config(page_title="Video Interleaver", page_icon="🎬")
 st.title("🎬 Video Interleaver")
 st.caption("Takes N seconds from each video in turn, round-robin, and stitches them into one file.")
@@ -51,10 +56,89 @@ def cut_segment(src, start, length, out_path, width, height):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-uploaded = st.file_uploader(
-    "Select your videos", type=["mp4", "mov", "mkv", "avi", "webm"],
-    accept_multiple_files=True,
+def download_video(url, folder, idx, on_progress):
+    """Download one video link (max 720p) into `folder`; returns the file path."""
+    opts = {
+        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(folder, f"dl_{idx}.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [on_progress],
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    for name in sorted(os.listdir(folder)):
+        if name.startswith(f"dl_{idx}.") and not name.endswith((".part", ".ytdl")):
+            return os.path.join(folder, name)
+    raise RuntimeError("Download finished but no file was found.")
+
+
+source = st.radio(
+    "Where are your videos?",
+    ["Upload from my device", "Paste YouTube links", "Both"],
+    horizontal=True,
 )
+
+uploaded = []
+if source in ("Upload from my device", "Both"):
+    uploaded = st.file_uploader(
+        "Select your videos", type=["mp4", "mov", "mkv", "avi", "webm"],
+        accept_multiple_files=True,
+    )
+
+links = []
+if source in ("Paste YouTube links", "Both"):
+    links_text = st.text_area(
+        "Paste video links (YouTube etc.), one per line",
+        placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
+        help="Only use videos you own or have permission to reuse. Downloaded at up to 720p.",
+    )
+    links = [ln.strip() for ln in links_text.splitlines() if ln.strip().lower().startswith("http")]
+if links:
+    if yt_dlp is None:
+        st.error("Link downloads need 'yt-dlp' in requirements.txt. Add it and redeploy.")
+    else:
+        st.caption(f"🔗 {len(links)} link(s) added. They are downloaded when you tap Stitch.")
+n_uploaded = len(uploaded) if uploaded else 0
+total_sources = n_uploaded + len(links)
+
+
+def fmt_time(seconds):
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m}:{s:02d}"
+
+
+# ---- "Ready" summary: shows each uploaded video once it has fully arrived ----
+if uploaded:
+    cache = st.session_state.setdefault("duration_cache", {})
+    lines = []
+    total_bytes = 0
+    for f in uploaded:
+        key = getattr(f, "file_id", None) or (f.name, f.size)
+        if key not in cache:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    suffix=os.path.splitext(f.name)[1], delete=False
+                ) as t:
+                    t.write(f.getbuffer())
+                    tmp_path = t.name
+                cache[key] = probe_duration(tmp_path)
+            except Exception:
+                cache[key] = None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+        dur = cache[key]
+        total_bytes += f.size
+        dur_txt = fmt_time(dur) if dur else "length unknown"
+        lines.append(f"✅ **{f.name}** — {f.size / 1e6:.1f} MB · {dur_txt}")
+    st.success(f"{len(uploaded)} video(s) fully uploaded · {total_bytes / 1e6:.1f} MB total")
+    st.markdown("\n\n".join(lines))
+elif not links:
+    st.info("No videos added yet.")
 
 col1, col2 = st.columns(2)
 seg_len = col1.number_input("Seconds per clip", min_value=1, max_value=300, value=15)
@@ -68,9 +152,12 @@ mode = st.radio(
 )
 sort_names = st.checkbox("Sort videos by file name", value=True)
 
-if st.button("Stitch videos", type="primary", disabled=not uploaded or len(uploaded) < 2):
+can_run = total_sources >= 2 and (yt_dlp is not None or not links)
+st.caption("Order: uploaded videos first, then links in the order you pasted them.")
+if st.button("Stitch videos", type="primary", disabled=not can_run):
     width, height = map(int, resolution.split(" ")[0].split("x"))
-    files = sorted(uploaded, key=lambda f: f.name) if sort_names else list(uploaded)
+    up_files = list(uploaded) if uploaded else []
+    files = sorted(up_files, key=lambda f: f.name) if sort_names else up_files
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = []
@@ -79,6 +166,31 @@ if st.button("Stitch videos", type="primary", disabled=not uploaded or len(uploa
             with open(p, "wb") as out:
                 out.write(f.getbuffer())
             paths.append(p)
+
+        if links:
+            dl_bar = st.progress(0.0, text="Downloading links...")
+            for k, url in enumerate(links):
+                def on_progress(d, k=k):
+                    if d.get("status") == "downloading":
+                        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                        frac = (d.get("downloaded_bytes", 0) / total) if total else 0.0
+                        overall = min((k + min(frac, 1.0)) / len(links), 1.0)
+                        dl_bar.progress(
+                            overall,
+                            text=f"Downloading link {k + 1} of {len(links)} ({frac * 100:.0f}%)",
+                        )
+                try:
+                    paths.append(download_video(url, tmp, k, on_progress))
+                except Exception as e:
+                    st.error(
+                        f"Could not download link {k + 1}: {url}\n\n"
+                        "The video may be private, age-restricted or removed. On a free cloud "
+                        "server YouTube can also block the download as a bot check. "
+                        "Try again later, or run the app on your own computer."
+                    )
+                    st.caption(f"Details: {str(e)[:300]}")
+                    st.stop()
+            dl_bar.empty()
 
         durations = [probe_duration(p) for p in paths]
         n = len(paths)
