@@ -59,6 +59,13 @@ uploaded = st.file_uploader(
 col1, col2 = st.columns(2)
 seg_len = col1.number_input("Seconds per clip", min_value=1, max_value=300, value=15)
 resolution = col2.selectbox("Output size", ["1280x720 (landscape)", "720x1280 (portrait)", "1920x1080 (landscape)"])
+mode = st.radio(
+    "Stitching pattern",
+    [
+        "Rotate through videos along the timeline (clip 1 from video 1, clip 2 from video 2, clip 3 from video 3, ... then back to video 1)",
+        "Each video in turn (first clip of every video, then the next clip of every video, ...)",
+    ],
+)
 sort_names = st.checkbox("Sort videos by file name", value=True)
 
 if st.button("Stitch videos", type="primary", disabled=not uploaded or len(uploaded) < 2):
@@ -74,18 +81,31 @@ if st.button("Stitch videos", type="primary", disabled=not uploaded or len(uploa
             paths.append(p)
 
         durations = [probe_duration(p) for p in paths]
-        rounds = max(math.ceil(d / seg_len) for d in durations)
+        n = len(paths)
+        slots = max(math.ceil(d / seg_len) for d in durations)
 
         jobs = []
-        for r in range(rounds):
-            for j, p in enumerate(paths):
-                start = r * seg_len
-                if start >= durations[j]:
-                    continue
-                # skip a tiny leftover tail (<0.5s) to avoid glitchy clips
-                if durations[j] - start < 0.5:
-                    continue
-                jobs.append((p, start, os.path.join(tmp, f"seg_{r:03d}_{j}.mp4")))
+
+        def add_job(j, start):
+            # skip if this video has ended, or only a tiny tail (<0.5s) is left
+            if start >= durations[j] or durations[j] - start < 0.5:
+                return
+            jobs.append((paths[j], start, os.path.join(tmp, f"seg_{len(jobs):05d}.mp4")))
+
+        if mode.startswith("Rotate"):
+            # clip 1 from video 1 (0-15s), clip 2 from video 2 (15-30s),
+            # clip 3 from video 3 (30-45s) ... then back to video 1, and so on
+            for g in range(slots * n):
+                add_job(g % n, g * seg_len)
+        else:
+            # first clip of every video, then the next clip of every video, ...
+            for r in range(slots):
+                for j in range(n):
+                    add_job(j, r * seg_len)
+
+        if not jobs:
+            st.error("No usable footage found in the uploaded videos.")
+            st.stop()
 
         progress = st.progress(0.0, text="Starting...")
         segs = []
