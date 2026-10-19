@@ -152,13 +152,35 @@ mode = st.radio(
 )
 sort_names = st.checkbox("Sort videos by file name", value=True)
 
+# ---- Final video order: uploads first (sorted if ticked), then links ----
+up_files = list(uploaded) if uploaded else []
+files = sorted(up_files, key=lambda f: f.name) if sort_names else up_files
+
+entries = []  # (stable key, label) in the order the videos will be used
+for i, f in enumerate(files):
+    fid = getattr(f, "file_id", None) or f"{f.name}-{f.size}-{i}"
+    entries.append((f"up_{fid}", f.name))
+for k, url in enumerate(links):
+    short = url if len(url) <= 55 else url[:52] + "..."
+    entries.append((f"lk_{k}_{url}", f"Link {k + 1}: {short}"))
+
+# ---- Cut amounts for each video (boxes follow the video if you re-sort) ----
+trims = []  # (cut_from_start, cut_from_end), same order as `entries`
+if entries:
+    st.markdown("**Cut from each video (seconds)**")
+    for idx, (key, label) in enumerate(entries):
+        st.markdown(f"{idx + 1}. {label}")
+        c_start, c_end = st.columns(2)
+        t_s = c_start.number_input(
+            "From start", min_value=0.0, max_value=3600.0, value=0.0, step=1.0, key=f"ts_{key}")
+        t_e = c_end.number_input(
+            "From end", min_value=0.0, max_value=3600.0, value=0.0, step=1.0, key=f"te_{key}")
+        trims.append((t_s, t_e))
+
 can_run = total_sources >= 2 and (yt_dlp is not None or not links)
 st.caption("Order: uploaded videos first, then links in the order you pasted them.")
 if st.button("Stitch videos", type="primary", disabled=not can_run):
     width, height = map(int, resolution.split(" ")[0].split("x"))
-    up_files = list(uploaded) if uploaded else []
-    files = sorted(up_files, key=lambda f: f.name) if sort_names else up_files
-
     with tempfile.TemporaryDirectory() as tmp:
         paths = []
         for i, f in enumerate(files):
@@ -194,15 +216,23 @@ if st.button("Stitch videos", type="primary", disabled=not can_run):
 
         durations = [probe_duration(p) for p in paths]
         n = len(paths)
-        slots = max(math.ceil(d / seg_len) for d in durations)
+        # usable length of each video after cutting the start and end
+        usable = [max(d - trims[j][0] - trims[j][1], 0.0) for j, d in enumerate(durations)]
+        for j, u in enumerate(usable):
+            if u < 0.5:
+                st.warning(f"Video {j + 1} is too short after trimming, so it is skipped.")
+        slots = max(math.ceil(u / seg_len) for u in usable)
 
         jobs = []
 
-        def add_job(j, start):
-            # skip if this video has ended, or only a tiny tail (<0.5s) is left
-            if start >= durations[j] or durations[j] - start < 0.5:
+        def add_job(j, offset):
+            # offset = seconds into the trimmed video. Skip if it has ended,
+            # or only a tiny tail (<0.5s) is left
+            if offset >= usable[j] or usable[j] - offset < 0.5:
                 return
-            jobs.append((paths[j], start, os.path.join(tmp, f"seg_{len(jobs):05d}.mp4")))
+            length = min(seg_len, usable[j] - offset)
+            jobs.append((paths[j], trims[j][0] + offset, length,
+                         os.path.join(tmp, f"seg_{len(jobs):05d}.mp4")))
 
         if mode.startswith("Rotate"):
             # clip 1 from video 1 (0-15s), clip 2 from video 2 (15-30s),
@@ -216,14 +246,14 @@ if st.button("Stitch videos", type="primary", disabled=not can_run):
                     add_job(j, r * seg_len)
 
         if not jobs:
-            st.error("No usable footage found in the uploaded videos.")
+            st.error("No usable footage left. Try cutting less from the start or end.")
             st.stop()
 
         progress = st.progress(0.0, text="Starting...")
         segs = []
         try:
-            for k, (p, start, outp) in enumerate(jobs):
-                cut_segment(p, start, seg_len, outp, width, height)
+            for k, (p, start, length, outp) in enumerate(jobs):
+                cut_segment(p, start, length, outp, width, height)
                 segs.append(outp)
                 progress.progress((k + 1) / len(jobs), text=f"Cutting clip {k + 1} of {len(jobs)}")
 
